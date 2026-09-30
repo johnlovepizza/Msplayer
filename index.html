@@ -2248,72 +2248,16 @@
       return added;
     }
 
-    // ===================== FLAC POST-SEARCH FILTER ENGINE =====================
-async function filterNonFlacResults() {
-    showToast("🔍 Scanning search results for FLAC...");
-    let flacTracks = [];
-    
-    // 1. Fetch deep details for all search results concurrently
-    const detailPromises = state.searchResults.map(async (track) => {
-        try {
-            if (!track.detailsLoaded) {
-                if (track.source === 'netease') await fetchNeteaseDetails(track);
-                else if (track.source === 'qq') await fetchQQDetails(track);
-                else if (track.source === 'kuwo') await fetchKuwoDetails(track);
-                else if (track.source === 'joox') await fetchJooxDetails(track);
-            }
-        } catch(e) {}
-    });
-    await Promise.all(detailPromises);
-    
-    // 2. Verify which tracks are genuinely FLAC
-    for (const track of state.searchResults) {
-        let isFlac = false;
-        
-        if (track.source === 'netease' && track.audioUrl) {
-            try {
-                // Netease requires a HEAD request to follow the redirect to the actual CDN file
-                let res = await fetch(track.audioUrl, { method: 'HEAD', redirect: 'follow' });
-                if (!res.ok && res.status !== 206) {
-                    res = await fetch(track.audioUrl, { method: 'GET', redirect: 'follow', headers: { Range: 'bytes=0-0' } });
-                }
-                isFlac = /\.flac(\?|$)/i.test(res.url);
-            } catch(e) {
-                isFlac = false;
-            }
-        } else {
-            // QQ, Kuwo, Joox resolve the actual file URL or set quality='lossless'
-            isFlac = track.audioUrl && (
-                /\.flac(\?|$)/i.test(track.audioUrl) || 
-                track.quality === 'lossless' || 
-                /flac|lossless|hi-res|atmos|母带|无损/i.test(track.qualityLabel || track.jooxQualityText || '')
-            );
-        }
-        
-        if (isFlac) {
-            flacTracks.push(track);
-        }
-    }
-    
-    // 3. Replace the search results with ONLY the verified FLAC tracks
-    state.searchResults = flacTracks;
-    state.trackMap.clear();
-    flacTracks.forEach(t => state.trackMap.set(t.uid, t));
-    
-    dom.searchCount.textContent = state.searchResults.length.toString();
-    renderMiniSearchList();
-    renderPlaylistList();
-    
-    if (flacTracks.length > 0) {
-        showToast(`✅ Found ${flacTracks.length} FLAC tracks!`);
-    } else {
-        showToast("❌ No FLAC files found. Try another search.");
-    }
-}
     // ===================== 聚合搜索 =====================
 
     async function searchAllSources(reset){
       if(!state.searchKeyword){showToast(t('toastNeedKeyword'));return;}
+      
+      // Force disable Joox (does not reliably return FLAC)
+      state.enabledSources.joox = false;
+      const cb = document.querySelector('.source-chip input[value="joox"]');
+      if(cb) cb.checked = false;
+
       const enabled=Object.keys(state.enabledSources).filter(k=>state.enabledSources[k]);
       if(!enabled.length){showToast(t('searchStatusNoSource'));return;}
       state.searchInProgress=true;
@@ -2353,9 +2297,6 @@ async function filterNonFlacResults() {
       renderMiniSearchList();
       renderPlaylistList();
       
-      // Run the FLAC filter here
-      await filterNonFlacResults();
-      
       if(!state.currentTrack && state.searchResults.length){
         playFromList('results',0);
       }
@@ -2367,249 +2308,98 @@ async function filterNonFlacResults() {
 
     // ===================== 各平台详情 =====================
 
-    // 网易云详情：搜索结果已返回播放、封面、歌词接口，这里只补全缓存歌曲和歌词内容
-    async function fetchNeteaseDetails(track){
-      if(track.songid){
-        if(!track.audioUrl){
-          track.audioUrl=`https://api.qijieya.cn/meting/?server=netease&type=url&id=${encodeURIComponent(track.songid)}`;
-        }
-        if(!track.lrcUrl){
-          track.lrcUrl=`https://api.qijieya.cn/meting/?server=netease&type=lrc&id=${encodeURIComponent(track.songid)}`;
-        }
-      }
-
-      if(track.audioUrl){
-        const q=inferQualityFromUrl(track.audioUrl);
-        track.quality=q.tag;
-        track.qualityLabel=q.label;
-      }
-
-      if(!track.lrc && track.lrcUrl){
-        try{
-          const lr=await fetch(track.lrcUrl);
-          const contentType=(lr.headers.get('content-type')||'').toLowerCase();
-          if(contentType.includes('json')){
-            const lj=await lr.json();
-            track.lrc =
-              (typeof lj === 'string' ? lj : null) ||
-              lj?.lrc ||
-              lj?.lyric ||
-              lj?.data?.lrc ||
-              lj?.data?.lyric ||
-              (typeof lj?.data === 'string' ? lj.data : null) ||
-              track.lrc ||
-              null;
-          }else{
-            track.lrc=await lr.text();
-          }
-        }catch(e){
-          console.warn('netease(qijieya meting) lyric fetch failed', e);
-        }
-      }
-
-      track.detailsLoaded=true;
-    }
-
-    // QQ 详情：根据搜索时的关键词 + song_mid(mid) 拿 url + lrc（tang API）
-    async function fetchQQDetails(track) {
-    // 优先用搜索时用过的关键词，保证和原始排序一致
-    const msg =
-        (track.qqSearchKey || track.keyword || '').trim() ||
-        ((track.title || '') + ' ' + (track.artist || '')).trim();
-
-    // 新接口用 mid：优先 qqId/songMid/songid
-    const mid =
-        (track.qqId || track.songMid || track.songid || '').toString().trim();
-
-    if (!mid) return;
-
-    const url =
-        `https://tang.api.s01s.cn/music_open_api.php` +
-        `?msg=${encodeURIComponent(msg)}` +
-        `&type=json` +
-        `&mid=${encodeURIComponent(mid)}`;
-
-    // 选择一个“最好”的播放链接（你也可以按需改优先级）
-    function pickBestPlayUrl(d) {
-        // lossless
-        if (d.song_play_url_sq) return { url: d.song_play_url_sq, tag: 'lossless', label: 'LOSSLESS', text: `SQ ${d.kbps_sq || ''}`.trim() };
-        if (d.song_play_url_pq) return { url: d.song_play_url_pq, tag: 'lossless', label: 'LOSSLESS', text: `PQ ${d.kbps_pq || ''}`.trim() };
-
-        // other variants
-        if (d.song_play_url_accom) return { url: d.song_play_url_accom, tag: 'hq', label: 'HQ', text: `ACCOM ${d.kbps_accom || ''}`.trim() };
-        if (d.song_play_url_hq) return { url: d.song_play_url_hq, tag: 'hq', label: 'HQ', text: `HQ ${d.kbps_hq || ''}`.trim() };
-
-        if (d.song_play_url_standard) return { url: d.song_play_url_standard, tag: 'standard', label: 'STD', text: `STD ${d.kbps_standard || ''}`.trim() };
-        if (d.song_play_url_fq) return { url: d.song_play_url_fq, tag: 'low', label: 'LOW', text: `FQ ${d.kbps_fq || ''}`.trim() };
-
-        // fallback
-        if (d.song_play_url) return { url: d.song_play_url, tag: null, label: null, text: null };
-
-        return { url: null, tag: null, label: null, text: null };
-    }
-
-    try {
+    async function fetchNeteaseDetails(track) {
+      if (!track.songid) return;
+      try {
+        // Uses musicdl's Xianyuw API (CORS friendly, returns Hi-Res/FLAC)
+        const url = `https://apii.xianyuw.cn/api/v1/163-music-search?id=${encodeURIComponent(track.songid)}&key=sk-84b3797f918481fda4d911c0f63b7431&no_url=0&br=hires`;
         const res = await fetch(url);
-        const d = await res.json();
-
-        // 基本校验：必须是对象且有 song_mid
-        if (!d || typeof d !== 'object' || !d.song_mid) {
-        throw new Error('qq detail error (invalid response)');
+        const json = await res.json();
+        if (json && json.data) {
+          track.audioUrl = json.data.url || track.audioUrl;
+          if (json.data.lrc) track.lrc = json.data.lrc;
+          if (json.data.cover) track.cover = json.data.cover;
         }
-
-        // 更新基础信息
-        track.title   = d.song_title || d.song_name || track.title;
-        track.artist  = d.singer_name || track.artist;
-        track.album   = d.album_name || d.album_title || track.album || '';
-        track.cover   = d.album_pic || d.singer_pic || track.cover;
-        track.pageUrl = d.song_h5_url || track.pageUrl;
-
-        // 播放链接（按优先级挑一个）
-        const best = pickBestPlayUrl(d);
-        track.audioUrl = best.url || track.audioUrl;
-
-        // 歌词
-        track.lrc = d.song_lyric || d.lyric || track.lrc;
-
-        // 文本信息（你原来用 qqQualityText，这里塞 vip + kbps/size 等）
-        track.qqQualityText =
-        best.text ||
-        (d.vip ? `VIP:${d.vip}` : null) ||
-        track.qqQualityText;
-
-        // quality / label：先用我们自己的选择，再用你已有 inferQualityFromUrl 兜底
-        if (best.tag && best.label) {
-        track.quality = best.tag;
-        track.qualityLabel = best.label;
-        }
-
-        if (track.audioUrl) {
+      } catch (e) { console.warn('netease api failed', e); }
+      
+      if (track.audioUrl) {
         const q = inferQualityFromUrl(track.audioUrl);
-        if (q && q.label) {
-            track.quality = q.tag;
-            track.qualityLabel = q.label;
-        }
-        }
-
-        track.detailsLoaded = true;
-    } catch (e) {
-        console.error('qq detail (tang)', e);
-        // 失败的话不要把 detailsLoaded 置 true，下次还有机会重试
-    }
-    }
-
-    async function fetchKuwoDetails(track){
-      const n=track.displayIndex || 1;
-      const api=`https://oiapi.net/api/Kuwo?msg=${encodeURIComponent(track.keyword)}&n=${encodeURIComponent(n)}&br=1`;
-      const res=await fetch(api);
-      const j=await res.json();
-      if(!j || !j.data || Array.isArray(j.data)) throw new Error('kuwo OIAPI detail failed');
-
-      const d=j.data;
-      Object.assign(track,{
-        title:d.song || track.title,
-        artist:d.singer || track.artist,
-        album:d.album || track.album,
-        cover:d.picture || track.cover,
-        songid:(d.rid ?? track.songid),
-        audioUrl:d.url || track.audioUrl,
-        lrc:d.lyric || d.lrc || d.lyrics || track.lrc || null,
-        lrcUrl:null,
-        detailsLoaded:true
-      });
-
-      // OIAPI br=1 请求无损；优先根据接口返回的 level / format 判断，URL 后缀作为兜底
-      const qualityText=`${d.level||''} ${d.format||''}`.toLowerCase();
-      if(/lossless|无损|flac|wav|ape|alac|aiff|zp|sq/.test(qualityText)){
-        track.quality='lossless';
-        track.qualityLabel='LOSSLESS';
-      }else if(track.audioUrl){
-        const q=inferQualityFromUrl(track.audioUrl);
-        track.quality=q.tag;
-        track.qualityLabel=q.label;
+        track.quality = q.tag;
+        track.qualityLabel = q.label;
       }
+      track.detailsLoaded = true;
     }
 
-    async function fetchJooxDetails(track){
-      const n=track.jooxIndex || track.displayIndex || 1;
-      const url=`https://apicx.asia/api/joox_music?msg=${encodeURIComponent(track.keyword)}&n=${encodeURIComponent(n)}&token=${encodeURIComponent(JOOX_TOKEN)}&br=${encodeURIComponent(JOOX_BR)}`;
-      const res=await fetch(url);
-      const j=await res.json();
-      if(!j || j.code!==200 || !j.data) throw new Error('joox detail failed');
+    async function fetchQQDetails(track) {
+      if (!track.songid && !track.songMid) return;
+      const mid = track.songMid || track.songid;
+      try {
+        // Uses musicdl's HK0 API (CORS friendly, returns FLAC)
+        const url = `https://api.hk0.cc/api/qqmusic?mid=${encodeURIComponent(mid)}`;
+        const res = await fetch(url);
+        const json = await res.json();
+        if (json) {
+          // song_play_url_sq is typically the FLAC/SQ link
+          track.audioUrl = json.song_play_url_sq || json.song_play_url_pq || json.song_play_url_hq || json.song_play_url_standard;
+          track.lrc = json.song_lyric || track.lrc;
+          if (json.album_pic) track.cover = json.album_pic;
+          if (json.song_name) track.title = json.song_name;
+          if (json.singer_name) track.artist = json.singer_name;
+          if (json.album_name) track.album = json.album_name;
+        }
+      } catch (e) { console.warn('qq api failed', e); }
 
-      const d=j.data;
-      const playLinks=d['播放链接']||{};
+      if (track.audioUrl) {
+        const q = inferQualityFromUrl(track.audioUrl);
+        track.quality = q.tag;
+        track.qualityLabel = q.label;
+      }
+      track.detailsLoaded = true;
+    }
 
-      async function probeJooxAudioUrl(u){
-        if(!u) return false;
+    async function fetchKuwoDetails(track) {
+      if (!track.songid) return;
+      const rid = track.songid.toString().replace('MUSIC_', '');
+      try {
+        // Uses musicdl's Haitangw API (CORS friendly, returns FLAC)
+        const url = `https://musicapi.haitangw.net/music/kw.php?id=${encodeURIComponent(rid)}&level=lossless&type=json`;
+        const res = await fetch(url);
+        const json = await res.json();
+        if (json && json.data && json.data.url) {
+          track.audioUrl = json.data.url;
+        }
+      } catch (e) { console.warn('kuwo api failed', e); }
 
-        async function request(method, extraOptions){
-          const controller=new AbortController();
-          const timer=setTimeout(()=>controller.abort(),3000);
-          try{
-            const res=await fetch(u,Object.assign({
-              method,
-              cache:'no-store',
-              redirect:'follow',
-              signal:controller.signal
-            },extraOptions||{}));
-            return res && (res.ok || res.status===206 || (res.status>=200 && res.status<400));
-          }finally{
-            clearTimeout(timer);
+      // Fallback to get metadata (album art/lyrics) if missing
+      if (!track.cover || !track.lrc) {
+        const n = track.displayIndex || 1;
+        try {
+          const api = `https://oiapi.net/api/Kuwo?msg=${encodeURIComponent(track.keyword)}&n=${encodeURIComponent(n)}&br=1`;
+          const res = await fetch(api);
+          const j = await res.json();
+          if (j && j.data && !Array.isArray(j.data)) {
+            const d = j.data;
+            track.title = d.song || track.title;
+            track.artist = d.singer || track.artist;
+            track.album = d.album || track.album;
+            track.cover = d.picture || track.cover;
+            track.lrc = d.lyric || d.lrc || d.lyrics || track.lrc;
+            if (!track.audioUrl) track.audioUrl = d.url;
           }
-        }
-
-        try{
-          if(await request('HEAD')) return true;
-        }catch(e){
-          // Some music CDN links do not allow HEAD. Try a tiny ranged GET below.
-        }
-
-        try{
-          return await request('GET',{headers:{Range:'bytes=0-0'}});
-        }catch(e){
-          return false;
-        }
+        } catch(e) {}
       }
 
-      async function pickJooxPlayUrl(links){
-        const order=['Atmos全景声','无损FLAC','Hi-Res无损','母带无损','OGG 320','MP3 320','AAC 192','OGG 192','MP3 128','AAC 96','AAC 48'];
-        for(const name of order){
-          const u=links[name];
-          if(!u)continue;
-          if(!(await probeJooxAudioUrl(u)))continue;
-          if(/母带|无损|flac|hi-res|atmos/i.test(name) || /\.flac(?:\?|$)/i.test(u)){
-            return {url:u, tag:'lossless', label:'LOSSLESS', text:name};
-          }
-          const m=name.match(/(\d+)$/);
-          if(m)return {url:u, tag:m[1]+'k', label:m[1]+'K', text:name};
-          return {url:u, tag:null, label:null, text:name};
-        }
-        return {url:null, tag:null, label:null, text:null};
+      if (track.audioUrl) {
+        const q = inferQualityFromUrl(track.audioUrl);
+        track.quality = q.tag;
+        track.qualityLabel = q.label;
       }
+      track.detailsLoaded = true;
+    }
 
-      const best=await pickJooxPlayUrl(playLinks);
-      Object.assign(track,{
-        title:d['歌曲名称']||track.title,
-        artist:d['歌手']||track.artist,
-        album:d['专辑']||track.album,
-        songid:d['歌曲ID']||track.songid,
-        songMid:d.songmid||track.songMid,
-        audioUrl:best.url||track.audioUrl,
-        lrc:d['歌词内容']||track.lrc||null,
-        lrcUrl:null,
-        jooxQualityText:best.text||track.jooxQualityText||null,
-        detailsLoaded:true
-      });
-
-      if(best.tag && best.label){
-        track.quality=best.tag;
-        track.qualityLabel=best.label;
-      }else if(track.audioUrl){
-        const q=inferQualityFromUrl(track.audioUrl);
-        track.quality=q.tag;
-        track.qualityLabel=q.label;
-      }
+    async function fetchJooxDetails(track) {
+      // Ignored as requested
+      track.detailsLoaded = true;
     }
 
     async function ensureTrackDetails(track){
@@ -2759,6 +2549,15 @@ async function filterNonFlacResults() {
         state.lyricLines = track.lrc ? parseLRC(track.lrc) : [];
         renderLyrics();
         if(!track.audioUrl){showToast(t('toastPlayError'));dom.playerStatus.textContent=t('playerStatusIdle');return;}
+        
+        // STRICT FLAC CHECK (Blocks playback if it isn't lossless)
+        const isFlac = /\.flac(\?|$)/i.test(track.audioUrl) || /lossless|flac|hi-res|atmos|母带|无损/i.test(track.qualityLabel || track.jooxQualityText || '');
+        if (!isFlac) {
+            showToast("⚠️ Blocked: This track is not FLAC.");
+            dom.playerStatus.textContent = "Blocked (Not FLAC)";
+            return; 
+        }
+
         dom.audio.src=track.audioUrl;
         await dom.audio.play();
         state.isPlaying=true;
@@ -2852,6 +2651,14 @@ async function filterNonFlacResults() {
     function handleDownloadCurrent(){
       const tr=state.currentTrack;
       if(!tr||!tr.audioUrl){showToast(t('toastDownloadNotReady'));return;}
+      
+      // STRICT FLAC CHECK (Blocks download if it isn't lossless)
+      const isFlac = /\.flac(\?|$)/i.test(tr.audioUrl) || /lossless|flac|hi-res|atmos|母带|无损/i.test(tr.qualityLabel || tr.jooxQualityText || '');
+      if (!isFlac) {
+          showToast("⚠️ Blocked: Not a FLAC file!");
+          return;
+      }
+      
       window.open(tr.audioUrl,'_blank');
     }
 
