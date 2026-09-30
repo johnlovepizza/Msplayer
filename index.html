@@ -2248,6 +2248,68 @@
       return added;
     }
 
+    // ===================== FLAC POST-SEARCH FILTER ENGINE =====================
+async function filterNonFlacResults() {
+    showToast("🔍 Scanning search results for FLAC...");
+    let flacTracks = [];
+    
+    // 1. Fetch deep details for all search results concurrently
+    const detailPromises = state.searchResults.map(async (track) => {
+        try {
+            if (!track.detailsLoaded) {
+                if (track.source === 'netease') await fetchNeteaseDetails(track);
+                else if (track.source === 'qq') await fetchQQDetails(track);
+                else if (track.source === 'kuwo') await fetchKuwoDetails(track);
+                else if (track.source === 'joox') await fetchJooxDetails(track);
+            }
+        } catch(e) {}
+    });
+    await Promise.all(detailPromises);
+    
+    // 2. Verify which tracks are genuinely FLAC
+    for (const track of state.searchResults) {
+        let isFlac = false;
+        
+        if (track.source === 'netease' && track.audioUrl) {
+            try {
+                // Netease requires a HEAD request to follow the redirect to the actual CDN file
+                let res = await fetch(track.audioUrl, { method: 'HEAD', redirect: 'follow' });
+                if (!res.ok && res.status !== 206) {
+                    res = await fetch(track.audioUrl, { method: 'GET', redirect: 'follow', headers: { Range: 'bytes=0-0' } });
+                }
+                isFlac = /\.flac(\?|$)/i.test(res.url);
+            } catch(e) {
+                isFlac = false;
+            }
+        } else {
+            // QQ, Kuwo, Joox resolve the actual file URL or set quality='lossless'
+            isFlac = track.audioUrl && (
+                /\.flac(\?|$)/i.test(track.audioUrl) || 
+                track.quality === 'lossless' || 
+                /flac|lossless|hi-res|atmos|母带|无损/i.test(track.qualityLabel || track.jooxQualityText || '')
+            );
+        }
+        
+        if (isFlac) {
+            flacTracks.push(track);
+        }
+    }
+    
+    // 3. Replace the search results with ONLY the verified FLAC tracks
+    state.searchResults = flacTracks;
+    state.trackMap.clear();
+    flacTracks.forEach(t => state.trackMap.set(t.uid, t));
+    
+    dom.searchCount.textContent = state.searchResults.length.toString();
+    renderMiniSearchList();
+    renderPlaylistList();
+    
+    if (flacTracks.length > 0) {
+        showToast(`✅ Found ${flacTracks.length} FLAC tracks!`);
+    } else {
+        showToast("❌ No FLAC files found. Try another search.");
+    }
+}
     // ===================== 聚合搜索 =====================
 
     async function searchAllSources(reset){
@@ -2290,6 +2352,10 @@
       dom.searchCount.textContent=state.searchResults.length.toString();
       renderMiniSearchList();
       renderPlaylistList();
+      
+      // Run the FLAC filter here
+      await filterNonFlacResults();
+      
       if(!state.currentTrack && state.searchResults.length){
         playFromList('results',0);
       }
@@ -2507,7 +2573,7 @@
       }
 
       async function pickJooxPlayUrl(links){
-        const order=['Atmos全景声','无损FLAC','Hi-Res无损','母带无损'];
+        const order=['Atmos全景声','无损FLAC','Hi-Res无损','母带无损','OGG 320','MP3 320','AAC 192','OGG 192','MP3 128','AAC 96','AAC 48'];
         for(const name of order){
           const u=links[name];
           if(!u)continue;
@@ -2693,14 +2759,6 @@
         state.lyricLines = track.lrc ? parseLRC(track.lrc) : [];
         renderLyrics();
         if(!track.audioUrl){showToast(t('toastPlayError'));dom.playerStatus.textContent=t('playerStatusIdle');return;}
-        // --- FLAC FILTER START ---
-        const isFlac = /\.flac(\?|$)/i.test(track.audioUrl) || /flac|lossless|hi-res|atmos|母带|无损/i.test(track.qualityLabel || track.jooxQualityText || '');
-        if (!isFlac) {
-             showToast("⚠️ Not FLAC. Auto-skipping...");
-             playNext('next');
-             return;
-         }
-         // --- FLAC FILTER END ---
         dom.audio.src=track.audioUrl;
         await dom.audio.play();
         state.isPlaying=true;
@@ -2794,15 +2852,6 @@
     function handleDownloadCurrent(){
       const tr=state.currentTrack;
       if(!tr||!tr.audioUrl){showToast(t('toastDownloadNotReady'));return;}
-
-      // --- FLAC DOWNLOAD FILTER START ---
-      const isFlac = /\.flac(\?|$)/i.test(tr.audioUrl) || /flac|lossless|hi-res|atmos|母带|无损/i.test(tr.qualityLabel || tr.jooxQualityText || '');
-      if (!isFlac) {
-          showToast("⚠️ Blocked: Not a FLAC file!");
-          return;
-      }
-      // --- FLAC DOWNLOAD FILTER END ---
-
       window.open(tr.audioUrl,'_blank');
     }
 
